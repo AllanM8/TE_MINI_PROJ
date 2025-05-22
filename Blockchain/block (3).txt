@@ -1,0 +1,308 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract BlockRealty is ReentrancyGuard {
+    uint256 private constant SECONDS_IN_MONTH = 30 days;
+
+    struct Property {
+        uint256 totalSupply;
+        uint256 propertyValueInWei;
+        uint256 tokensSold;
+        uint256 rentalPricePerMonth;
+        mapping(address => uint256) balances;
+        address renter;
+        uint256 rentalEndTime;
+    }
+
+    struct TokenListing {
+        address seller;
+        uint256 amount;
+        uint256 priceInWei;
+    }
+    
+    // Struct for returning listing info
+    struct ListedTokenInfo {
+        uint256 propertyId;
+        address seller;
+        uint256 amount;
+        uint256 priceInWei;
+    }
+
+    mapping(uint256 => Property) private properties;
+    // Mapping: propertyId => (seller => TokenListing)
+    mapping(uint256 => mapping(address => TokenListing)) private listings;
+    // Mapping: propertyId => array of seller addresses with active listings
+    mapping(uint256 => address[]) private listingSellers;
+    // Optimized: mapping to store index of each seller in the listingSellers array for a property
+    mapping(uint256 => mapping(address => uint256)) private listingSellerIndex;
+    
+    mapping(uint256 => mapping(address => uint256)) public claimedRevenue;
+    mapping(uint256 => uint256) public totalRevenuePerProperty;
+    
+    uint256 public propertyCount;
+    address payable public admin;
+    uint256 public lockedFunds;
+
+    // Events
+    event TokensPurchased(uint256 indexed propertyId, address indexed buyer, uint256 amount);
+    event TokensTransferred(uint256 indexed propertyId, address indexed from, address indexed to, uint256 amount);
+    event RentalStarted(uint256 indexed propertyId, address indexed renter, uint256 duration, uint256 rentalEndTime);
+    event RentalEnded(uint256 indexed propertyId, address indexed renter);
+    event RevenueDistributed(uint256 indexed propertyId, uint256 totalAmount);
+    event PayoutClaimed(uint256 indexed propertyId, address indexed recipient, uint256 amount);
+    event RentalPriceSet(uint256 indexed propertyId, uint256 rentalPricePerMonth);
+    event PropertyListed(uint256 indexed propertyId, uint256 propertyValueInWei, uint256 initialSupply);
+    event PropertyRemoved(uint256 indexed propertyId);
+    event RentalExtended(uint256 indexed propertyId, address indexed renter, uint256 additionalMonths, uint256 newEndTime);
+    event TokensBurned(uint256 indexed propertyId, address indexed burner, uint256 amount);
+    event TokensListedForSale(uint256 indexed propertyId, address indexed seller, uint256 amount, uint256 priceInWei);
+    event TokensSold(uint256 indexed propertyId, address indexed seller, address indexed buyer, uint256 amount, uint256 priceInWei);
+    event AdminWithdrawn(address indexed admin, uint256 amount);
+
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Only admin");
+        _;
+    }
+
+    modifier onlyRenter(uint256 _propertyId) {
+        require(msg.sender == properties[_propertyId].renter, "Only renter");
+        _;
+    }
+
+    modifier validProperty(uint256 _propertyId) {
+        require(_propertyId < propertyCount, "Invalid property");
+        _;
+    }
+
+    constructor() {
+        admin = payable(msg.sender);
+    }
+
+    // Property Management
+    function addProperty(uint256 _initialSupply, uint256 _propertyValueInWei) external onlyAdmin {
+        require(_initialSupply > 0, "Invalid supply");
+        // Removed min 1 gwei check for _propertyValueInWei
+
+        Property storage newProperty = properties[propertyCount];
+        newProperty.totalSupply = _initialSupply;
+        newProperty.propertyValueInWei = _propertyValueInWei;
+        newProperty.balances[admin] = _initialSupply;
+
+        emit PropertyListed(propertyCount, _propertyValueInWei, _initialSupply);
+        propertyCount++;
+    }
+
+    function removeProperty(uint256 _propertyId) external onlyAdmin validProperty(_propertyId) {
+        require(properties[_propertyId].renter == address(0), "Currently rented");
+        delete properties[_propertyId];
+        emit PropertyRemoved(_propertyId);
+    }
+
+    // Token Transactions
+    function purchaseTokens(uint256 _propertyId) external payable nonReentrant validProperty(_propertyId) {
+        // Removed min 1 gwei check for msg.value
+        Property storage property = properties[_propertyId];
+        uint256 tokenPrice = property.propertyValueInWei / property.totalSupply;
+        uint256 tokensToBuy = msg.value / tokenPrice;
+
+        require(property.balances[admin] >= tokensToBuy, "Insufficient tokens");
+        
+        property.tokensSold += tokensToBuy;
+        property.balances[admin] -= tokensToBuy;
+        property.balances[msg.sender] += tokensToBuy;
+
+        emit TokensPurchased(_propertyId, msg.sender, tokensToBuy);
+    }
+
+    function transferTokens(uint256 _propertyId, address _to, uint256 _amount) external nonReentrant validProperty(_propertyId) {
+        require(_to != address(0), "Invalid recipient");
+        require(_amount > 0, "Invalid amount");
+
+        Property storage property = properties[_propertyId];
+        require(property.balances[msg.sender] >= _amount, "Insufficient balance");
+
+        property.balances[msg.sender] -= _amount;
+        property.balances[_to] += _amount;
+
+        emit TokensTransferred(_propertyId, msg.sender, _to, _amount);
+    }
+
+    // Revenue Management
+    function distributeRevenue(uint256 _propertyId) external payable onlyAdmin nonReentrant validProperty(_propertyId) {
+        require(msg.value > 0, "No revenue");
+        totalRevenuePerProperty[_propertyId] += msg.value;
+        lockedFunds += msg.value;
+        emit RevenueDistributed(_propertyId, msg.value);
+    }
+
+    function claimRevenue(uint256 _propertyId) external nonReentrant validProperty(_propertyId) {
+        Property storage property = properties[_propertyId];
+        require(property.totalSupply > 0, "No tokens");
+
+        uint256 totalRevenue = totalRevenuePerProperty[_propertyId];
+        uint256 share = (property.balances[msg.sender] * totalRevenue) / property.totalSupply;
+        uint256 unclaimed = share - claimedRevenue[_propertyId][msg.sender];
+        
+        require(unclaimed > 0, "Nothing to claim");
+        
+        claimedRevenue[_propertyId][msg.sender] += unclaimed;
+        lockedFunds -= unclaimed;
+        payable(msg.sender).transfer(unclaimed);
+
+        emit PayoutClaimed(_propertyId, msg.sender, unclaimed);
+    }
+
+    // Rental Management
+    function setRentalPrice(uint256 _propertyId, uint256 _price) external onlyAdmin validProperty(_propertyId) {
+        // Removed min 1 gwei check for _price
+        properties[_propertyId].rentalPricePerMonth = _price;
+        emit RentalPriceSet(_propertyId, _price);
+    }
+
+    function rentProperty(uint256 _propertyId, uint256 _months) external payable nonReentrant validProperty(_propertyId) {
+        require(_months > 0 && _months < type(uint256).max / SECONDS_IN_MONTH, "Invalid duration");
+        
+        Property storage property = properties[_propertyId];
+        require(property.renter == address(0), "Already rented");
+
+        uint256 cost = property.rentalPricePerMonth * _months;
+        require(msg.value >= cost, "Insufficient ETH");
+
+        property.renter = msg.sender;
+        property.rentalEndTime = block.timestamp + (_months * SECONDS_IN_MONTH);
+        lockedFunds += msg.value;
+
+        emit RentalStarted(_propertyId, msg.sender, _months, property.rentalEndTime);
+    }
+
+    function extendRental(uint256 _propertyId, uint256 _additionalMonths) external payable nonReentrant onlyRenter(_propertyId) validProperty(_propertyId) {
+        require(_additionalMonths > 0, "Invalid extension");
+        
+        Property storage property = properties[_propertyId];
+        uint256 cost = property.rentalPricePerMonth * _additionalMonths;
+        require(msg.value >= cost, "Insufficient ETH");
+
+        property.rentalEndTime += _additionalMonths * SECONDS_IN_MONTH;
+        lockedFunds += msg.value;
+
+        emit RentalExtended(_propertyId, msg.sender, _additionalMonths, property.rentalEndTime);
+    }
+
+    // The endRental function has been removed as per request.
+
+    // Secondary Market
+    function listForSale(uint256 _propertyId, uint256 _amount, uint256 _price) external nonReentrant validProperty(_propertyId) {
+        require(_amount > 0 && _price > 0, "Invalid params");
+        
+        Property storage property = properties[_propertyId];
+        require(property.balances[msg.sender] >= _amount, "Insufficient balance");
+
+        // If there's no active listing for the seller, add them to the listingSellers array and record its index
+        if (listings[_propertyId][msg.sender].amount == 0) {
+            listingSellerIndex[_propertyId][msg.sender] = listingSellers[_propertyId].length;
+            listingSellers[_propertyId].push(msg.sender);
+        }
+        listings[_propertyId][msg.sender] = TokenListing(msg.sender, _amount, _price);
+        emit TokensListedForSale(_propertyId, msg.sender, _amount, _price);
+    }
+
+    function buyListedTokens(uint256 _propertyId, address _seller) external payable nonReentrant validProperty(_propertyId) {
+        TokenListing storage listing = listings[_propertyId][_seller];
+        require(listing.amount > 0, "Listing expired");
+
+        uint256 totalCost = listing.amount * listing.priceInWei;
+        require(msg.value >= totalCost, "Insufficient ETH");
+
+        Property storage property = properties[_propertyId];
+        require(property.balances[_seller] >= listing.amount, "Seller insufficient");
+
+        // Transfer tokens
+        property.balances[_seller] -= listing.amount;
+        property.balances[msg.sender] += listing.amount;
+
+        // Transfer ETH and refund any overpayment
+        payable(_seller).transfer(totalCost);
+        if (msg.value > totalCost) {
+            payable(msg.sender).transfer(msg.value - totalCost);
+        }
+
+        // Optimized removal of seller from tracking array using stored index
+        uint256 index = listingSellerIndex[_propertyId][_seller];
+        uint256 lastIndex = listingSellers[_propertyId].length - 1;
+        if (index != lastIndex) {
+            address lastSeller = listingSellers[_propertyId][lastIndex];
+            listingSellers[_propertyId][index] = lastSeller;
+            listingSellerIndex[_propertyId][lastSeller] = index;
+        }
+        listingSellers[_propertyId].pop();
+        delete listingSellerIndex[_propertyId][_seller];
+        
+        delete listings[_propertyId][_seller];
+        
+        emit TokensSold(_propertyId, _seller, msg.sender, listing.amount, listing.priceInWei);
+    }
+
+    // Utility Functions
+    function burnTokens(uint256 _propertyId, uint256 _amount) external nonReentrant validProperty(_propertyId) {
+        require(_amount > 0, "Invalid amount");
+        
+        Property storage property = properties[_propertyId];
+        require(property.balances[msg.sender] >= _amount, "Insufficient balance");
+        require(property.totalSupply > _amount, "Cannot burn last token");
+
+        property.balances[msg.sender] -= _amount;
+        property.totalSupply -= _amount;
+        emit TokensBurned(_propertyId, msg.sender, _amount);
+    }
+
+    function withdraw(uint256 amount) external onlyAdmin {
+        require(amount <= address(this).balance - lockedFunds, "Insufficient available");
+        admin.transfer(amount);
+        emit AdminWithdrawn(msg.sender, amount);
+    }
+
+    // View Functions
+    function balanceOf(uint256 _propertyId, address account) external view validProperty(_propertyId) returns (uint256) {
+        return properties[_propertyId].balances[account];
+    }
+
+    function getPropertyDetails(uint256 _propertyId) external view validProperty(_propertyId) returns (
+        uint256 value,
+        uint256 sold,
+        uint256 rentalPrice
+    ) {
+        Property storage p = properties[_propertyId];
+        return (p.propertyValueInWei, p.tokensSold, p.rentalPricePerMonth);
+    }
+
+    function getUserTokenDetails(address _user) external view returns (uint256[] memory ids, uint256[] memory balances) {
+        ids = new uint256[](propertyCount);
+        balances = new uint256[](propertyCount);
+        
+        for (uint256 i = 0; i < propertyCount; i++) {
+            ids[i] = i;
+            balances[i] = properties[i].balances[_user];
+        }
+        return (ids, balances);
+    }
+
+    // New function: Returns all active token listings for a specific property.
+    // Each entry includes: property id, seller address, number of tokens listed, and price per token.
+    function getListedTokens(uint256 _propertyId) external view validProperty(_propertyId) returns (ListedTokenInfo[] memory) {
+        address[] storage sellers = listingSellers[_propertyId];
+        uint256 count = sellers.length;
+        ListedTokenInfo[] memory result = new ListedTokenInfo[](count);
+        for (uint256 i = 0; i < count; i++) {
+            TokenListing storage listing = listings[_propertyId][sellers[i]];
+            result[i] = ListedTokenInfo({
+                propertyId: _propertyId,
+                seller: sellers[i],
+                amount: listing.amount,
+                priceInWei: listing.priceInWei
+            });
+        }
+        return result;
+    }
+}
